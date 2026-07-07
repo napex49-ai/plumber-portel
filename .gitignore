@@ -1,0 +1,4 @@
+﻿flask_secret.key
+*.db
+__pycache__/
+*.pyc
