@@ -1,63 +1,12 @@
 """
-Plumber Loyalty Program — Plumber & Distributor Portal (Phase 3, revised)
-==========================================================================
-
-A website used by two kinds of people:
-
-  Plumbers:
-    - Register (name, phone, PIN, shop details, distributor code)
-    - Log in with phone + PIN
-    - Enter a scratch-label code to earn points
-    - See their points balance and history
-    - Generate a short-lived redemption request to show their distributor
-
-  Distributors:
-    - Register and get a unique distributor code to hand out to plumbers
-    - Log in with phone + PIN
-    - See pending redemption requests from their own plumbers
-    - Approve or reject each request
-
-Uses the SAME codes.db you've already been generating codes into
-(via code_generator.py) — this just adds new tables to it for
-plumbers, distributors, points, login security, and redemption
-requests. Nothing about your existing codes/batches is touched.
-
-Changes from the first draft:
-  - PINs are now hashed (werkzeug), never stored or compared in plain text.
-  - 5 wrong login attempts locks that phone number for 15 minutes.
-  - The Flask session secret is generated once and saved to
-    flask_secret.key, so restarting the server no longer logs everyone out.
-  - Distributors are now a real thing: they register, get a distributor
-    code, and plumbers must enter that code at registration. This links
-    every plumber to a real distributor_id (previously always null).
-  - A distributor dashboard exists to approve/reject redemption requests
-    — previously a plumber could generate a request code with nowhere
-    for anyone to act on it.
-  - Points are now reserved (debited) the moment a redemption request is
-    created, and refunded automatically if it's rejected or expires
-    unresolved. Previously balance was only checked at request time, so
-    a plumber could open several requests that together exceeded their
-    real balance.
-  - Redemption request codes now retry on the very unlikely chance of a
-    collision instead of crashing.
-  - New landing page at "/" explaining the program with separate
-    Plumber / Distributor login and register options.
-
-NOTE: if you already ran the earlier draft of this app and have real
-plumber rows with a plain-text "pin" column, this version expects a
-"pin_hash" column and a distributor_id that points at a real row — you'll
-need to re-register any test accounts created under the old version.
-
-Run locally with:
-    pip install flask
-    python3 app.py
-
-Then open http://127.0.0.1:5000 in your browser.
+Plumber Loyalty Program — Plumber & Distributor Portal (Phase 3, Neon Postgres Edition)
+========================================================================================
 """
 
 import os
 import re
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import secrets
 import string
 from datetime import datetime, timezone, timedelta
@@ -66,7 +15,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 from code_generator import unformat_code, validate_checksum, ALPHABET_INDEX
 
-DB_PATH = os.environ.get("DB_PATH", "codes.db")
+# Provide your Neon connection string here or in your terminal environment variables
+DATABASE_URL = os.environ.get("DATABASE_URL")
 REDEMPTION_REQUEST_VALID_MINUTES = 10
 MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_MINUTES = 15
@@ -74,7 +24,6 @@ SECRET_KEY_PATH = os.environ.get("SECRET_KEY_PATH", "flask_secret.key")
 
 
 def get_secret_key():
-    # Prefer an env var if the host provides one (survives redeploys even without a persistent disk)
     env_key = os.environ.get("SECRET_KEY")
     if env_key:
         return env_key
@@ -97,8 +46,9 @@ app.secret_key = get_secret_key()
 
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is missing. Set it to your Neon connection string.")
+        g.db = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     return g.db
 
 
@@ -109,87 +59,95 @@ def close_db(exception):
         db.close()
 
 
+def db_execute(conn, query, params=()):
+    """Helper to execute a query and return a fetchable cursor."""
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute(query, params)
+    return cur
+
+
 def init_portal_tables():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS distributors (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            phone TEXT UNIQUE NOT NULL,
-            pin_hash TEXT NOT NULL,
-            distributor_code TEXT UNIQUE NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS plumbers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            phone TEXT UNIQUE NOT NULL,
-            pin_hash TEXT NOT NULL,
-            shop_name TEXT,
-            address TEXT,
-            distributor_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (distributor_id) REFERENCES distributors (id)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS points_ledger (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            plumber_id INTEGER NOT NULL,
-            code_id INTEGER,
-            type TEXT NOT NULL,          -- 'credit' or 'debit'
-            amount INTEGER NOT NULL,
-            balance_after INTEGER NOT NULL,
-            note TEXT,
-            created_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS redemption_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            request_code TEXT UNIQUE NOT NULL,
-            plumber_id INTEGER NOT NULL,
-            points_requested INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',  -- pending / approved / rejected / expired
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            resolved_at TEXT,
-            resolved_by TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS login_attempts (
-            phone TEXT NOT NULL,
-            role TEXT NOT NULL,
-            attempt_count INTEGER NOT NULL DEFAULT 0,
-            locked_until TEXT,
-            last_attempt_at TEXT,
-            PRIMARY KEY (phone, role)
-        )
-    """)
+    if not DATABASE_URL:
+        return
+        
+    conn = psycopg2.connect(DATABASE_URL)
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS distributors (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(150) NOT NULL,
+                phone VARCHAR(15) UNIQUE NOT NULL,
+                pin_hash VARCHAR(255) NOT NULL,
+                distributor_code VARCHAR(10) UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS plumbers (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(150) NOT NULL,
+                phone VARCHAR(15) UNIQUE NOT NULL,
+                pin_hash VARCHAR(255) NOT NULL,
+                shop_name VARCHAR(200),
+                address VARCHAR(255),
+                distributor_id INTEGER REFERENCES distributors (id) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS points_ledger (
+                id SERIAL PRIMARY KEY,
+                plumber_id INTEGER NOT NULL,
+                code_id INTEGER,
+                type VARCHAR(10) NOT NULL, 
+                amount INTEGER NOT NULL,
+                balance_after INTEGER NOT NULL,
+                note VARCHAR(255),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS redemption_requests (
+                id SERIAL PRIMARY KEY,
+                request_code VARCHAR(12) UNIQUE NOT NULL,
+                plumber_id INTEGER NOT NULL,
+                points_requested INTEGER NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                resolved_at TIMESTAMP,
+                resolved_by VARCHAR(150)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                phone VARCHAR(15) NOT NULL,
+                role VARCHAR(20) NOT NULL,
+                attempt_count SMALLINT NOT NULL DEFAULT 0,
+                locked_until TIMESTAMP,
+                last_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (phone, role)
+            )
+        """)
     conn.commit()
     conn.close()
 
 
 def get_points_balance(conn, plumber_id) -> int:
-    row = conn.execute(
-        "SELECT balance_after FROM points_ledger WHERE plumber_id = ? ORDER BY id DESC LIMIT 1",
-        (plumber_id,),
+    row = db_execute(conn,
+        "SELECT balance_after FROM points_ledger WHERE plumber_id = %s ORDER BY id DESC LIMIT 1",
+        (plumber_id,)
     ).fetchone()
     return row["balance_after"] if row else 0
 
 
 def add_ledger_entry(conn, plumber_id, entry_type, amount, note, code_id=None):
-    """Adds a credit/debit entry and returns the new balance. Caller must commit."""
     current = get_points_balance(conn, plumber_id)
     new_balance = current + amount if entry_type == "credit" else current - amount
-    conn.execute(
+    db_execute(conn,
         """INSERT INTO points_ledger (plumber_id, code_id, type, amount, balance_after, note, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (plumber_id, code_id, entry_type, amount, new_balance,
-         note, datetime.now(timezone.utc).isoformat()),
+           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+        (plumber_id, code_id, entry_type, amount, new_balance, note, datetime.now(timezone.utc))
     )
     return new_balance
 
@@ -198,7 +156,7 @@ def generate_distributor_code(conn):
     alphabet = string.ascii_uppercase + string.digits
     for _ in range(20):
         code = "".join(secrets.choice(alphabet) for _ in range(6))
-        if not conn.execute("SELECT id FROM distributors WHERE distributor_code = ?", (code,)).fetchone():
+        if not db_execute(conn, "SELECT id FROM distributors WHERE distributor_code = %s", (code,)).fetchone():
             return code
     raise RuntimeError("Could not generate a unique distributor code — try again.")
 
@@ -206,24 +164,24 @@ def generate_distributor_code(conn):
 def generate_request_code(conn):
     for _ in range(20):
         code = "".join(secrets.choice(string.digits) for _ in range(8))
-        if not conn.execute("SELECT id FROM redemption_requests WHERE request_code = ?", (code,)).fetchone():
+        if not db_execute(conn, "SELECT id FROM redemption_requests WHERE request_code = %s", (code,)).fetchone():
             return code
     raise RuntimeError("Could not generate a unique redemption request code — try again.")
 
 
 def expire_old_requests(conn, plumber_id=None):
-    """Marks overdue pending requests as expired and refunds their reserved points."""
-    now = datetime.now(timezone.utc).isoformat()
-    query = "SELECT * FROM redemption_requests WHERE status = 'pending' AND expires_at < ?"
+    now = datetime.now(timezone.utc)
+    query = "SELECT * FROM redemption_requests WHERE status = 'pending' AND expires_at < %s"
     params = [now]
     if plumber_id is not None:
-        query += " AND plumber_id = ?"
+        query += " AND plumber_id = %s"
         params.append(plumber_id)
-    expired = conn.execute(query, params).fetchall()
+    
+    expired = db_execute(conn, query, tuple(params)).fetchall()
     for r in expired:
         add_ledger_entry(conn, r["plumber_id"], "credit", r["points_requested"],
                           f"Refund — redemption request {r['request_code']} expired unresolved")
-        conn.execute("UPDATE redemption_requests SET status = 'expired', resolved_at = ? WHERE id = ?",
+        db_execute(conn, "UPDATE redemption_requests SET status = 'expired', resolved_at = %s WHERE id = %s",
                       (now, r["id"]))
     if expired:
         conn.commit()
@@ -234,13 +192,16 @@ def expire_old_requests(conn, plumber_id=None):
 # ---------------------------------------------------------------------
 
 def check_lockout(conn, phone, role):
-    """Returns minutes remaining if locked, else None."""
-    row = conn.execute(
-        "SELECT * FROM login_attempts WHERE phone = ? AND role = ?", (phone, role)
+    row = db_execute(conn,
+        "SELECT * FROM login_attempts WHERE phone = %s AND role = %s", (phone, role)
     ).fetchone()
     if not row or not row["locked_until"]:
         return None
-    locked_until = datetime.fromisoformat(row["locked_until"])
+        
+    locked_until = row["locked_until"]
+    if locked_until.tzinfo is None:
+        locked_until = locked_until.replace(tzinfo=timezone.utc)
+        
     now = datetime.now(timezone.utc)
     if now < locked_until:
         return int((locked_until - now).total_seconds() // 60) + 1
@@ -248,32 +209,32 @@ def check_lockout(conn, phone, role):
 
 
 def record_failed_attempt(conn, phone, role):
-    row = conn.execute(
-        "SELECT * FROM login_attempts WHERE phone = ? AND role = ?", (phone, role)
+    row = db_execute(conn,
+        "SELECT * FROM login_attempts WHERE phone = %s AND role = %s", (phone, role)
     ).fetchone()
     now = datetime.now(timezone.utc)
     if row:
         count = row["attempt_count"] + 1
         locked_until = None
         if count >= MAX_LOGIN_ATTEMPTS:
-            locked_until = (now + timedelta(minutes=LOCKOUT_MINUTES)).isoformat()
+            locked_until = now + timedelta(minutes=LOCKOUT_MINUTES)
             count = 0
-        conn.execute(
-            "UPDATE login_attempts SET attempt_count = ?, locked_until = ?, last_attempt_at = ? "
-            "WHERE phone = ? AND role = ?",
-            (count, locked_until, now.isoformat(), phone, role),
+        db_execute(conn,
+            "UPDATE login_attempts SET attempt_count = %s, locked_until = %s, last_attempt_at = %s "
+            "WHERE phone = %s AND role = %s",
+            (count, locked_until, now, phone, role),
         )
     else:
-        conn.execute(
+        db_execute(conn,
             "INSERT INTO login_attempts (phone, role, attempt_count, locked_until, last_attempt_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (phone, role, 1, None, now.isoformat()),
+            "VALUES (%s, %s, %s, %s, %s)",
+            (phone, role, 1, None, now),
         )
     conn.commit()
 
 
 def reset_attempts(conn, phone, role):
-    conn.execute("DELETE FROM login_attempts WHERE phone = ? AND role = ?", (phone, role))
+    db_execute(conn, "DELETE FROM login_attempts WHERE phone = %s AND role = %s", (phone, role))
     conn.commit()
 
 
@@ -281,14 +242,14 @@ def current_plumber(conn):
     pid = session.get("plumber_id")
     if not pid:
         return None
-    return conn.execute("SELECT * FROM plumbers WHERE id = ?", (pid,)).fetchone()
+    return db_execute(conn, "SELECT * FROM plumbers WHERE id = %s", (pid,)).fetchone()
 
 
 def current_distributor(conn):
     did = session.get("distributor_id")
     if not did:
         return None
-    return conn.execute("SELECT * FROM distributors WHERE id = ?", (did,)).fetchone()
+    return db_execute(conn, "SELECT * FROM distributors WHERE id = %s", (did,)).fetchone()
 
 
 # ---------------------------------------------------------------------
@@ -335,25 +296,24 @@ def register():
     if not pin.isdigit() or len(pin) != 4:
         return render_template_string(REGISTER_PAGE, error="PIN must be exactly 4 digits.")
 
-    distributor = conn.execute(
-        "SELECT id FROM distributors WHERE distributor_code = ?", (distributor_code,)
+    distributor = db_execute(conn, 
+        "SELECT id FROM distributors WHERE distributor_code = %s", (distributor_code,)
     ).fetchone()
     if not distributor:
         return render_template_string(REGISTER_PAGE, error="That distributor code wasn't found. Check it with your distributor.")
 
-    existing = conn.execute("SELECT id FROM plumbers WHERE phone = ?", (phone,)).fetchone()
+    existing = db_execute(conn, "SELECT id FROM plumbers WHERE phone = %s", (phone,)).fetchone()
     if existing:
         return render_template_string(REGISTER_PAGE, error="This phone number is already registered. Please log in instead.")
 
-    conn.execute(
+    db_execute(conn,
         """INSERT INTO plumbers (name, phone, pin_hash, shop_name, address, distributor_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (name, phone, generate_password_hash(pin), shop_name, address, distributor["id"],
-         datetime.now(timezone.utc).isoformat()),
+           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+        (name, phone, generate_password_hash(pin), shop_name, address, distributor["id"], datetime.now(timezone.utc))
     )
     conn.commit()
 
-    plumber = conn.execute("SELECT id FROM plumbers WHERE phone = ?", (phone,)).fetchone()
+    plumber = db_execute(conn, "SELECT id FROM plumbers WHERE phone = %s", (phone,)).fetchone()
     session.clear()
     session["plumber_id"] = plumber["id"]
     return redirect(url_for("dashboard"))
@@ -372,7 +332,7 @@ def login():
     if lock_minutes:
         return render_template_string(LOGIN_PAGE, error=f"Too many failed attempts. Try again in {lock_minutes} minute(s).")
 
-    plumber = conn.execute("SELECT * FROM plumbers WHERE phone = ?", (phone,)).fetchone()
+    plumber = db_execute(conn, "SELECT * FROM plumbers WHERE phone = %s", (phone,)).fetchone()
     if not plumber or not check_password_hash(plumber["pin_hash"], pin):
         record_failed_attempt(conn, phone, "plumber")
         return render_template_string(LOGIN_PAGE, error="Incorrect phone number or PIN.")
@@ -393,13 +353,13 @@ def dashboard():
     expire_old_requests(conn, plumber["id"])
 
     balance = get_points_balance(conn, plumber["id"])
-    history = conn.execute(
-        "SELECT * FROM points_ledger WHERE plumber_id = ? ORDER BY id DESC LIMIT 20",
-        (plumber["id"],),
+    history = db_execute(conn,
+        "SELECT * FROM points_ledger WHERE plumber_id = %s ORDER BY id DESC LIMIT 20",
+        (plumber["id"],)
     ).fetchall()
-    pending_requests = conn.execute(
-        "SELECT * FROM redemption_requests WHERE plumber_id = ? AND status = 'pending' ORDER BY id DESC",
-        (plumber["id"],),
+    pending_requests = db_execute(conn,
+        "SELECT * FROM redemption_requests WHERE plumber_id = %s AND status = 'pending' ORDER BY id DESC",
+        (plumber["id"],)
     ).fetchall()
 
     return render_template_string(
@@ -417,15 +377,11 @@ def redeem_code():
         return redirect(url_for("home"))
 
     raw_input = request.form.get("codes", "") or request.form.get("code", "")
-
-    # Split on newlines, commas, or whitespace so people can paste codes in any of those layouts
     candidates = [c for c in re.split(r"[,\s]+", raw_input.strip()) if c]
 
     if not candidates:
         return redirect(url_for("dashboard", error="Please enter at least one code."))
 
-    # De-duplicate while preserving order, so entering the same code twice in one paste
-    # doesn't get treated as two separate attempts
     seen = set()
     codes_to_process = []
     for c in candidates:
@@ -437,16 +393,14 @@ def redeem_code():
     accepted_lines = []
     failed_lines = []
     total_points = 0
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
 
     for original, raw in codes_to_process:
-        # Step 1: fast checksum check, no DB hit needed for obvious typos
         if not validate_checksum(raw):
             failed_lines.append(f"{original}: mistyped / invalid code")
             continue
 
-        # Step 2: look it up in the codes table
-        code_row = conn.execute("SELECT * FROM codes WHERE code = ?", (raw,)).fetchone()
+        code_row = db_execute(conn, "SELECT * FROM codes WHERE code = %s", (raw,)).fetchone()
         if not code_row:
             failed_lines.append(f"{original}: not found in our system")
             continue
@@ -455,10 +409,9 @@ def redeem_code():
             failed_lines.append(f"{original}: already redeemed")
             continue
 
-        # Step 3: mark redeemed + credit points, as a single atomic operation
-        points_earned = code_row["denomination"]  # 1 point per ₹1 of denomination — adjust ratio here if you want a different conversion
-        conn.execute(
-            "UPDATE codes SET status = 'redeemed', redeemed_by_plumber_id = ?, redeemed_at = ? WHERE id = ?",
+        points_earned = code_row["denomination"]
+        db_execute(conn,
+            "UPDATE codes SET status = 'redeemed', redeemed_by_plumber_id = %s, redeemed_at = %s WHERE id = %s",
             (plumber["id"], now, code_row["id"]),
         )
         add_ledger_entry(conn, plumber["id"], "credit", points_earned,
@@ -503,13 +456,12 @@ def request_redemption():
     now = datetime.now(timezone.utc)
     expires = now + timedelta(minutes=REDEMPTION_REQUEST_VALID_MINUTES)
 
-    conn.execute(
+    db_execute(conn,
         """INSERT INTO redemption_requests
            (request_code, plumber_id, points_requested, status, created_at, expires_at)
-           VALUES (?, ?, ?, 'pending', ?, ?)""",
-        (request_code, plumber["id"], points_requested, now.isoformat(), expires.isoformat()),
+           VALUES (%s, %s, %s, 'pending', %s, %s)""",
+        (request_code, plumber["id"], points_requested, now, expires),
     )
-    # Reserve the points immediately so the same balance can't be requested twice over.
     add_ledger_entry(conn, plumber["id"], "debit", points_requested,
                       f"Reserved for redemption request {request_code}")
     conn.commit()
@@ -541,19 +493,19 @@ def distributor_register():
     if not pin.isdigit() or len(pin) != 4:
         return render_template_string(DISTRIBUTOR_REGISTER_PAGE, error="PIN must be exactly 4 digits.")
 
-    existing = conn.execute("SELECT id FROM distributors WHERE phone = ?", (phone,)).fetchone()
+    existing = db_execute(conn, "SELECT id FROM distributors WHERE phone = %s", (phone,)).fetchone()
     if existing:
         return render_template_string(DISTRIBUTOR_REGISTER_PAGE, error="This phone number is already registered. Please log in instead.")
 
     distributor_code = generate_distributor_code(conn)
-    conn.execute(
+    db_execute(conn,
         """INSERT INTO distributors (name, phone, pin_hash, distributor_code, created_at)
-           VALUES (?, ?, ?, ?, ?)""",
-        (name, phone, generate_password_hash(pin), distributor_code, datetime.now(timezone.utc).isoformat()),
+           VALUES (%s, %s, %s, %s, %s)""",
+        (name, phone, generate_password_hash(pin), distributor_code, datetime.now(timezone.utc))
     )
     conn.commit()
 
-    distributor = conn.execute("SELECT id FROM distributors WHERE phone = ?", (phone,)).fetchone()
+    distributor = db_execute(conn, "SELECT id FROM distributors WHERE phone = %s", (phone,)).fetchone()
     session.clear()
     session["distributor_id"] = distributor["id"]
     return redirect(url_for("distributor_dashboard"))
@@ -572,7 +524,7 @@ def distributor_login():
     if lock_minutes:
         return render_template_string(DISTRIBUTOR_LOGIN_PAGE, error=f"Too many failed attempts. Try again in {lock_minutes} minute(s).")
 
-    distributor = conn.execute("SELECT * FROM distributors WHERE phone = ?", (phone,)).fetchone()
+    distributor = db_execute(conn, "SELECT * FROM distributors WHERE phone = %s", (phone,)).fetchone()
     if not distributor or not check_password_hash(distributor["pin_hash"], pin):
         record_failed_attempt(conn, phone, "distributor")
         return render_template_string(DISTRIBUTOR_LOGIN_PAGE, error="Incorrect phone number or PIN.")
@@ -592,24 +544,26 @@ def distributor_dashboard():
 
     expire_old_requests(conn)
 
-    pending = conn.execute(
+    pending = db_execute(conn,
         """SELECT rr.*, p.name AS plumber_name, p.phone AS plumber_phone, p.shop_name AS plumber_shop
            FROM redemption_requests rr
            JOIN plumbers p ON p.id = rr.plumber_id
-           WHERE p.distributor_id = ? AND rr.status = 'pending'
+           WHERE p.distributor_id = %s AND rr.status = 'pending'
            ORDER BY rr.id DESC""",
-        (distributor["id"],),
+        (distributor["id"],)
     ).fetchall()
-    resolved = conn.execute(
+    
+    resolved = db_execute(conn,
         """SELECT rr.*, p.name AS plumber_name, p.phone AS plumber_phone
            FROM redemption_requests rr
            JOIN plumbers p ON p.id = rr.plumber_id
-           WHERE p.distributor_id = ? AND rr.status != 'pending'
+           WHERE p.distributor_id = %s AND rr.status != 'pending'
            ORDER BY rr.id DESC LIMIT 20""",
-        (distributor["id"],),
+        (distributor["id"],)
     ).fetchall()
-    plumber_count = conn.execute(
-        "SELECT COUNT(*) AS c FROM plumbers WHERE distributor_id = ?", (distributor["id"],)
+    
+    plumber_count = db_execute(conn, 
+        "SELECT COUNT(*) AS c FROM plumbers WHERE distributor_id = %s", (distributor["id"],)
     ).fetchone()["c"]
 
     return render_template_string(
@@ -631,12 +585,12 @@ def resolve_request():
         return redirect(url_for("distributor_dashboard", error="Invalid request."))
     action = request.form.get("action")
 
-    req = conn.execute(
+    req = db_execute(conn,
         """SELECT rr.*, p.distributor_id AS plumber_distributor_id
            FROM redemption_requests rr
            JOIN plumbers p ON p.id = rr.plumber_id
-           WHERE rr.id = ?""",
-        (request_id,),
+           WHERE rr.id = %s""",
+        (request_id,)
     ).fetchone()
 
     if not req or req["plumber_distributor_id"] != distributor["id"]:
@@ -644,11 +598,11 @@ def resolve_request():
     if req["status"] != "pending":
         return redirect(url_for("distributor_dashboard", error="This request has already been resolved."))
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
 
     if action == "approve":
-        conn.execute(
-            "UPDATE redemption_requests SET status = 'approved', resolved_at = ?, resolved_by = ? WHERE id = ?",
+        db_execute(conn,
+            "UPDATE redemption_requests SET status = 'approved', resolved_at = %s, resolved_by = %s WHERE id = %s",
             (now, distributor["name"], req["id"]),
         )
         conn.commit()
@@ -657,8 +611,8 @@ def resolve_request():
     elif action == "reject":
         add_ledger_entry(conn, req["plumber_id"], "credit", req["points_requested"],
                           f"Refund — redemption request {req['request_code']} rejected by distributor")
-        conn.execute(
-            "UPDATE redemption_requests SET status = 'rejected', resolved_at = ?, resolved_by = ? WHERE id = ?",
+        db_execute(conn,
+            "UPDATE redemption_requests SET status = 'rejected', resolved_at = %s, resolved_by = %s WHERE id = %s",
             (now, distributor["name"], req["id"]),
         )
         conn.commit()
@@ -668,8 +622,7 @@ def resolve_request():
 
 
 # ---------------------------------------------------------------------
-# HTML templates (kept inline for a single-file app — fine for now;
-# split into templates/ if this grows much further)
+# HTML templates 
 # ---------------------------------------------------------------------
 
 BASE_STYLE = """
@@ -859,7 +812,7 @@ DASHBOARD_PAGE = BASE_STYLE + """
     <table>
       <tr><th>Request code</th><th>Points</th><th>Expires</th></tr>
       {% for r in pending_requests %}
-      <tr><td>{{ r['request_code'] }}</td><td>{{ r['points_requested'] }}</td><td>{{ r['expires_at'][11:16] }} UTC</td></tr>
+      <tr><td>{{ r['request_code'] }}</td><td>{{ r['points_requested'] }}</td><td>{{ r['expires_at'].strftime('%H:%M') if r['expires_at'] else '' }} UTC</td></tr>
       {% endfor %}
     </table>
   {% endif %}
@@ -898,7 +851,7 @@ DISTRIBUTOR_DASHBOARD_PAGE = BASE_STYLE + """
       <td>{{ r['request_code'] }}</td>
       <td>{{ r['plumber_name'] }}<br><span style="color:#999;">{{ r['plumber_phone'] }}</span></td>
       <td>{{ r['points_requested'] }}</td>
-      <td>{{ r['expires_at'][11:16] }} UTC</td>
+      <td>{{ r['expires_at'].strftime('%H:%M') if r['expires_at'] else '' }} UTC</td>
       <td>
         <form method="post" action="/distributor/resolve-request" style="display:inline;">
           <input type="hidden" name="request_id" value="{{ r['id'] }}">
@@ -941,12 +894,7 @@ DISTRIBUTOR_DASHBOARD_PAGE = BASE_STYLE + """
 </div>
 """
 
-
-# Ensure tables exist whenever this module is imported — including by a production
-# server like gunicorn, which never runs the __main__ block below.
 init_portal_tables()
 
 if __name__ == "__main__":
-    # Local development only. In production, run this with gunicorn instead
-    # (see Procfile) — debug mode must never be on for anything public-facing.
     app.run(debug=True)
