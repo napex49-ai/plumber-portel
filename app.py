@@ -302,9 +302,12 @@ def register():
     if not distributor:
         return render_template_string(REGISTER_PAGE, error="That distributor code wasn't found. Check it with your distributor.")
 
-    existing = db_execute(conn, "SELECT id FROM plumbers WHERE phone = %s", (phone,)).fetchone()
-    if existing:
-        return render_template_string(REGISTER_PAGE, error="This phone number is already registered. Please log in instead.")
+    # FIX: Check BOTH tables for the phone number
+    existing_plumber = db_execute(conn, "SELECT id FROM plumbers WHERE phone = %s", (phone,)).fetchone()
+    existing_dist = db_execute(conn, "SELECT id FROM distributors WHERE phone = %s", (phone,)).fetchone()
+    
+    if existing_plumber or existing_dist:
+        return render_template_string(REGISTER_PAGE, error="This phone number is already registered in our system. Please log in instead.")
 
     db_execute(conn,
         """INSERT INTO plumbers (name, phone, pin_hash, shop_name, address, distributor_id, created_at)
@@ -493,9 +496,12 @@ def distributor_register():
     if not pin.isdigit() or len(pin) != 4:
         return render_template_string(DISTRIBUTOR_REGISTER_PAGE, error="PIN must be exactly 4 digits.")
 
-    existing = db_execute(conn, "SELECT id FROM distributors WHERE phone = %s", (phone,)).fetchone()
-    if existing:
-        return render_template_string(DISTRIBUTOR_REGISTER_PAGE, error="This phone number is already registered. Please log in instead.")
+    # FIX: Check BOTH tables for the phone number
+    existing_dist = db_execute(conn, "SELECT id FROM distributors WHERE phone = %s", (phone,)).fetchone()
+    existing_plumber = db_execute(conn, "SELECT id FROM plumbers WHERE phone = %s", (phone,)).fetchone()
+    
+    if existing_dist or existing_plumber:
+        return render_template_string(DISTRIBUTOR_REGISTER_PAGE, error="This phone number is already registered in our system. Please log in instead.")
 
     distributor_code = generate_distributor_code(conn)
     db_execute(conn,
