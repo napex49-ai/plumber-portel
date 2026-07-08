@@ -1,6 +1,6 @@
 """
-Plumber Loyalty Program — Plumber & Distributor Portal (Final Edition)
-======================================================================
+Plumber Loyalty Program — Plumber & Distributor Portal (Final Edition w/ Deletion)
+=================================================================================
 """
 
 import os
@@ -315,8 +315,58 @@ def admin_dashboard():
     return render_template_string(
         ADMIN_DASHBOARD_PAGE, 
         distributors=distributors, 
-        plumbers=plumbers
+        plumbers=plumbers,
+        message=request.args.get("message"),
+        error=request.args.get("error")
     )
+
+
+@app.route("/admin/delete-plumber", methods=["POST"])
+def admin_delete_plumber():
+    if not current_admin():
+        return redirect(url_for("admin_login"))
+    
+    conn = get_db()
+    pid = request.form.get("plumber_id")
+    
+    # 1. Unlink redeemed codes so they aren't orphaned (they remain redeemed, but unlinked to this deleted user)
+    db_execute(conn, "UPDATE codes SET redeemed_by_plumber_id = NULL WHERE redeemed_by_plumber_id = %s", (pid,))
+    
+    # 2. Delete all related history to prevent crashes
+    db_execute(conn, "DELETE FROM points_ledger WHERE plumber_id = %s", (pid,))
+    db_execute(conn, "DELETE FROM redemption_requests WHERE plumber_id = %s", (pid,))
+    
+    # 3. Get phone number, delete login attempts, then delete plumber
+    p = db_execute(conn, "SELECT phone FROM plumbers WHERE id = %s", (pid,)).fetchone()
+    if p:
+        db_execute(conn, "DELETE FROM login_attempts WHERE phone = %s AND role = 'plumber'", (p['phone'],))
+        db_execute(conn, "DELETE FROM plumbers WHERE id = %s", (pid,))
+        
+    conn.commit()
+    return redirect(url_for("admin_dashboard", message="Plumber account and all associated data permanently deleted."))
+
+
+@app.route("/admin/delete-distributor", methods=["POST"])
+def admin_delete_distributor():
+    if not current_admin():
+        return redirect(url_for("admin_login"))
+    
+    conn = get_db()
+    did = request.form.get("distributor_id")
+    
+    # Check safety lock: Ensure distributor has no active plumbers
+    count = db_execute(conn, "SELECT COUNT(*) AS c FROM plumbers WHERE distributor_id = %s", (did,)).fetchone()["c"]
+    if count > 0:
+        return redirect(url_for("admin_dashboard", error="Action Blocked: This distributor still has active plumbers connected to them. You must delete their plumbers first."))
+        
+    # Get phone number, delete login attempts, then delete distributor
+    d = db_execute(conn, "SELECT phone FROM distributors WHERE id = %s", (did,)).fetchone()
+    if d:
+        db_execute(conn, "DELETE FROM login_attempts WHERE phone = %s AND role = 'distributor'", (d['phone'],))
+        db_execute(conn, "DELETE FROM distributors WHERE id = %s", (did,))
+        
+    conn.commit()
+    return redirect(url_for("admin_dashboard", message="Distributor account permanently deleted."))
 
 
 # ---------------------------------------------------------------------
@@ -681,7 +731,7 @@ BASE_STYLE = """
   * { box-sizing: border-box; }
   body { font-family: 'Segoe UI', Arial, sans-serif; background:#faf5f5; margin:0; padding:0; color:#1a1a1a; }
   .box { max-width:420px; margin:40px auto; background:#fff; padding:28px 32px; border-radius:12px; box-shadow:0 2px 10px rgba(0,0,0,0.08); }
-  .admin-box { max-width:1000px; margin:40px auto; background:#fff; padding:28px 32px; border-radius:12px; box-shadow:0 2px 10px rgba(0,0,0,0.08); }
+  .admin-box { max-width:1050px; margin:40px auto; background:#fff; padding:28px 32px; border-radius:12px; box-shadow:0 2px 10px rgba(0,0,0,0.08); }
   h2 { color:#8b0000; margin-top:0; }
   label { font-size:13px; color:#555; font-weight:600; }
   input { width:100%; padding:10px; margin:6px 0 14px 0; border:1px solid #ccc; border-radius:6px; font-size:15px; }
@@ -692,7 +742,7 @@ BASE_STYLE = """
   .btn-outline:hover { background:#fdecea; }
   a { color:#c0392b; text-decoration:none; }
   .error { background:#fdecea; color:#a33; padding:10px 14px; border-radius:8px; margin-bottom:14px; font-size:14px; white-space:pre-line; }
-  .message { background:#fdecea; color:#8b0000; padding:10px 14px; border-radius:8px; margin-bottom:14px; font-size:14px; white-space:pre-line; }
+  .message { background:#d4edda; color:#1a7f4b; padding:10px 14px; border-radius:8px; margin-bottom:14px; font-size:14px; white-space:pre-line; }
   .balance { font-size:34px; font-weight:bold; color:#c0392b; text-align:center; margin:10px 0; }
   table { width:100%; border-collapse:collapse; margin-top:10px; font-size:13px; }
   th, td { text-align:left; padding:8px 6px; border-bottom:1px solid #eee; }
@@ -777,11 +827,13 @@ ADMIN_LOGIN_PAGE = BASE_STYLE + """
 ADMIN_DASHBOARD_PAGE = BASE_STYLE + """
 <div class="admin-box">
   <h2>Super Admin Dashboard</h2>
+  {% if message %}<div class="message">{{ message }}</div>{% endif %}
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
   <hr>
   
   <h3>Registered Distributors ({{ distributors|length }})</h3>
   <table>
-    <tr><th>ID</th><th>Name</th><th>Phone</th><th>Distributor Code</th><th>Date Joined</th></tr>
+    <tr><th>ID</th><th>Name</th><th>Phone</th><th>Distributor Code</th><th>Date Joined</th><th>Action</th></tr>
     {% for d in distributors %}
     <tr>
       <td>{{ d['id'] }}</td>
@@ -789,6 +841,12 @@ ADMIN_DASHBOARD_PAGE = BASE_STYLE + """
       <td>{{ d['phone'] }}</td>
       <td><span class="pill pill-pending" style="font-family:monospace; font-size:14px;">{{ d['distributor_code'] }}</span></td>
       <td>{{ d['created_at'].strftime('%Y-%m-%d') }}</td>
+      <td>
+        <form method="post" action="/admin/delete-distributor" style="display:inline;" onsubmit="return confirm('WARNING: Are you sure you want to delete this distributor? You can only do this if they have zero active plumbers connected to them.');">
+          <input type="hidden" name="distributor_id" value="{{ d['id'] }}">
+          <button type="submit" style="padding:4px 8px; font-size:11px; background:#a33;">Delete</button>
+        </form>
+      </td>
     </tr>
     {% endfor %}
   </table>
@@ -797,7 +855,7 @@ ADMIN_DASHBOARD_PAGE = BASE_STYLE + """
   
   <h3>Registered Plumbers ({{ plumbers|length }})</h3>
   <table>
-    <tr><th>ID</th><th>Name</th><th>Phone</th><th>Shop Name</th><th>Connected Distributor</th><th>Date Joined</th></tr>
+    <tr><th>ID</th><th>Name</th><th>Phone</th><th>Shop Name</th><th>Connected Distributor</th><th>Date Joined</th><th>Action</th></tr>
     {% for p in plumbers %}
     <tr>
       <td>{{ p['id'] }}</td>
@@ -806,6 +864,12 @@ ADMIN_DASHBOARD_PAGE = BASE_STYLE + """
       <td>{{ p['shop_name'] or '--' }}</td>
       <td><span class="pill pill-approved">{{ p['distributor_name'] }}</span></td>
       <td>{{ p['created_at'].strftime('%Y-%m-%d') }}</td>
+      <td>
+        <form method="post" action="/admin/delete-plumber" style="display:inline;" onsubmit="return confirm('WARNING: Deleting this plumber will permanently erase their account, point balance, and redemption history. This cannot be undone. Continue?');">
+          <input type="hidden" name="plumber_id" value="{{ p['id'] }}">
+          <button type="submit" style="padding:4px 8px; font-size:11px; background:#a33;">Delete</button>
+        </form>
+      </td>
     </tr>
     {% endfor %}
   </table>
@@ -818,7 +882,7 @@ ADMIN_DASHBOARD_PAGE = BASE_STYLE + """
 LOGIN_PAGE = BASE_STYLE + """
 <div class="box">
   <h2>Plumber Login</h2>
-  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  {% if error %}<div class="error" style="background:#fdecea; color:#a33;">{{ error }}</div>{% endif %}
   <form method="post" action="/login">
     <label>Phone number</label>
     <input type="text" name="phone" maxlength="10" required>
@@ -834,7 +898,7 @@ LOGIN_PAGE = BASE_STYLE + """
 REGISTER_PAGE = BASE_STYLE + """
 <div class="box">
   <h2>Plumber Registration</h2>
-  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  {% if error %}<div class="error" style="background:#fdecea; color:#a33;">{{ error }}</div>{% endif %}
   <form method="post" action="/register">
     <label>Full name</label>
     <input type="text" name="name" required>
@@ -858,7 +922,7 @@ REGISTER_PAGE = BASE_STYLE + """
 DISTRIBUTOR_LOGIN_PAGE = BASE_STYLE + """
 <div class="box">
   <h2>Distributor Login</h2>
-  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  {% if error %}<div class="error" style="background:#fdecea; color:#a33;">{{ error }}</div>{% endif %}
   <form method="post" action="/distributor/login">
     <label>Phone number</label>
     <input type="text" name="phone" maxlength="10" required>
@@ -874,7 +938,7 @@ DISTRIBUTOR_LOGIN_PAGE = BASE_STYLE + """
 DISTRIBUTOR_REGISTER_PAGE = BASE_STYLE + """
 <div class="box">
   <h2>Distributor Registration</h2>
-  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  {% if error %}<div class="error" style="background:#fdecea; color:#a33;">{{ error }}</div>{% endif %}
   <form method="post" action="/distributor/register">
     <label>Full name / business name</label>
     <input type="text" name="name" required>
@@ -892,8 +956,8 @@ DISTRIBUTOR_REGISTER_PAGE = BASE_STYLE + """
 DASHBOARD_PAGE = BASE_STYLE + """
 <div class="box">
   <h2>Hello, {{ plumber['name'] }}</h2>
-  {% if message %}<div class="message">{{ message }}</div>{% endif %}
-  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  {% if message %}<div class="message" style="background:#d4edda; color:#1a7f4b;">{{ message }}</div>{% endif %}
+  {% if error %}<div class="error" style="background:#fdecea; color:#a33;">{{ error }}</div>{% endif %}
 
   <div>Your points balance</div>
   <div class="balance">{{ balance }}</div>
@@ -940,8 +1004,8 @@ DASHBOARD_PAGE = BASE_STYLE + """
 DISTRIBUTOR_DASHBOARD_PAGE = BASE_STYLE + """
 <div class="box" style="max-width:680px;">
   <h2>Welcome, {{ distributor['name'] }}</h2>
-  {% if message %}<div class="message">{{ message }}</div>{% endif %}
-  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  {% if message %}<div class="message" style="background:#d4edda; color:#1a7f4b;">{{ message }}</div>{% endif %}
+  {% if error %}<div class="error" style="background:#fdecea; color:#a33;">{{ error }}</div>{% endif %}
 
   <p>Your distributor code — share this with plumbers so they can register under you:</p>
   <div class="balance" style="font-size:26px; letter-spacing:3px;">{{ distributor['distributor_code'] }}</div>
