@@ -1,6 +1,6 @@
 """
-Plumber Loyalty Program — Plumber & Distributor Portal (Phase 3, Neon Postgres Edition)
-========================================================================================
+Plumber Loyalty Program — Plumber & Distributor Portal (Final Edition)
+======================================================================
 """
 
 import os
@@ -21,6 +21,7 @@ REDEMPTION_REQUEST_VALID_MINUTES = 10
 MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_MINUTES = 15
 SECRET_KEY_PATH = os.environ.get("SECRET_KEY_PATH", "flask_secret.key")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin1234") # Change via Render Environment Variables
 
 
 def get_secret_key():
@@ -251,6 +252,9 @@ def current_distributor(conn):
         return None
     return db_execute(conn, "SELECT * FROM distributors WHERE id = %s", (did,)).fetchone()
 
+def current_admin():
+    return session.get("admin_logged_in")
+
 
 # ---------------------------------------------------------------------
 # Routes — home / landing
@@ -263,6 +267,8 @@ def home():
         return redirect(url_for("dashboard"))
     if current_distributor(conn):
         return redirect(url_for("distributor_dashboard"))
+    if current_admin():
+        return redirect(url_for("admin_dashboard"))
     return render_template_string(LANDING_PAGE)
 
 
@@ -270,6 +276,47 @@ def home():
 def logout():
     session.clear()
     return redirect(url_for("home"))
+
+
+# ---------------------------------------------------------------------
+# Routes — Admin
+# ---------------------------------------------------------------------
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    if request.method == "GET":
+        return render_template_string(ADMIN_LOGIN_PAGE)
+    
+    password = request.form.get("password", "")
+    if password == ADMIN_PASSWORD:
+        session.clear()
+        session["admin_logged_in"] = True
+        return redirect(url_for("admin_dashboard"))
+    
+    return render_template_string(ADMIN_LOGIN_PAGE, error="Invalid admin password.")
+
+
+@app.route("/admin/dashboard")
+def admin_dashboard():
+    if not current_admin():
+        return redirect(url_for("admin_login"))
+        
+    conn = get_db()
+    
+    distributors = db_execute(conn, "SELECT * FROM distributors ORDER BY created_at DESC").fetchall()
+    
+    plumbers = db_execute(conn, """
+        SELECT p.*, d.name AS distributor_name 
+        FROM plumbers p 
+        LEFT JOIN distributors d ON p.distributor_id = d.id 
+        ORDER BY p.created_at DESC
+    """).fetchall()
+
+    return render_template_string(
+        ADMIN_DASHBOARD_PAGE, 
+        distributors=distributors, 
+        plumbers=plumbers
+    )
 
 
 # ---------------------------------------------------------------------
@@ -302,7 +349,6 @@ def register():
     if not distributor:
         return render_template_string(REGISTER_PAGE, error="That distributor code wasn't found. Check it with your distributor.")
 
-    # FIX: Check BOTH tables for the phone number
     existing_plumber = db_execute(conn, "SELECT id FROM plumbers WHERE phone = %s", (phone,)).fetchone()
     existing_dist = db_execute(conn, "SELECT id FROM distributors WHERE phone = %s", (phone,)).fetchone()
     
@@ -496,7 +542,6 @@ def distributor_register():
     if not pin.isdigit() or len(pin) != 4:
         return render_template_string(DISTRIBUTOR_REGISTER_PAGE, error="PIN must be exactly 4 digits.")
 
-    # FIX: Check BOTH tables for the phone number
     existing_dist = db_execute(conn, "SELECT id FROM distributors WHERE phone = %s", (phone,)).fetchone()
     existing_plumber = db_execute(conn, "SELECT id FROM plumbers WHERE phone = %s", (phone,)).fetchone()
     
@@ -636,6 +681,7 @@ BASE_STYLE = """
   * { box-sizing: border-box; }
   body { font-family: 'Segoe UI', Arial, sans-serif; background:#faf5f5; margin:0; padding:0; color:#1a1a1a; }
   .box { max-width:420px; margin:40px auto; background:#fff; padding:28px 32px; border-radius:12px; box-shadow:0 2px 10px rgba(0,0,0,0.08); }
+  .admin-box { max-width:1000px; margin:40px auto; background:#fff; padding:28px 32px; border-radius:12px; box-shadow:0 2px 10px rgba(0,0,0,0.08); }
   h2 { color:#8b0000; margin-top:0; }
   label { font-size:13px; color:#555; font-weight:600; }
   input { width:100%; padding:10px; margin:6px 0 14px 0; border:1px solid #ccc; border-radius:6px; font-size:15px; }
@@ -657,7 +703,6 @@ BASE_STYLE = """
   .pill-approved { background:#d4edda; color:#1a7f4b; }
   .pill-rejected { background:#fdeaea; color:#a33; }
   .pill-expired { background:#eee; color:#777; }
-
   .hero { background:linear-gradient(135deg,#8b0000,#c0392b); color:#fff; padding:60px 20px 80px; text-align:center; }
   .hero h1 { font-size:32px; margin-bottom:10px; }
   .hero p { font-size:16px; max-width:560px; margin:0 auto; opacity:0.92; }
@@ -677,6 +722,7 @@ BASE_STYLE = """
 </style>
 """
 
+# Completely stealth landing page (no admin links)
 LANDING_PAGE = BASE_STYLE + """
 <div class="hero">
   <h1>Plumber Rewards Program</h1>
@@ -712,6 +758,60 @@ LANDING_PAGE = BASE_STYLE + """
       </div>
     </div>
   </div>
+</div>
+"""
+
+ADMIN_LOGIN_PAGE = BASE_STYLE + """
+<div class="box">
+  <h2>Admin Access</h2>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="post" action="/admin/login">
+    <label>Admin Password</label>
+    <input type="password" name="password" required>
+    <button type="submit">Access Dashboard</button>
+  </form>
+  <p style="text-align:center; margin-top:14px;"><a href="/">&larr; Back home</a></p>
+</div>
+"""
+
+ADMIN_DASHBOARD_PAGE = BASE_STYLE + """
+<div class="admin-box">
+  <h2>Super Admin Dashboard</h2>
+  <hr>
+  
+  <h3>Registered Distributors ({{ distributors|length }})</h3>
+  <table>
+    <tr><th>ID</th><th>Name</th><th>Phone</th><th>Distributor Code</th><th>Date Joined</th></tr>
+    {% for d in distributors %}
+    <tr>
+      <td>{{ d['id'] }}</td>
+      <td><strong>{{ d['name'] }}</strong></td>
+      <td>{{ d['phone'] }}</td>
+      <td><span class="pill pill-pending" style="font-family:monospace; font-size:14px;">{{ d['distributor_code'] }}</span></td>
+      <td>{{ d['created_at'].strftime('%Y-%m-%d') }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  
+  <hr>
+  
+  <h3>Registered Plumbers ({{ plumbers|length }})</h3>
+  <table>
+    <tr><th>ID</th><th>Name</th><th>Phone</th><th>Shop Name</th><th>Connected Distributor</th><th>Date Joined</th></tr>
+    {% for p in plumbers %}
+    <tr>
+      <td>{{ p['id'] }}</td>
+      <td><strong>{{ p['name'] }}</strong></td>
+      <td>{{ p['phone'] }}</td>
+      <td>{{ p['shop_name'] or '--' }}</td>
+      <td><span class="pill pill-approved">{{ p['distributor_name'] }}</span></td>
+      <td>{{ p['created_at'].strftime('%Y-%m-%d') }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <hr>
+  <p style="text-align:center;"><a href="/logout">Log out Admin</a></p>
 </div>
 """
 
