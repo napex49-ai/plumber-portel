@@ -1,6 +1,6 @@
 """
-Plumber Loyalty Program — Plumber & Distributor Portal (Final Edition w/ Deletion)
-=================================================================================
+Plumber Loyalty Program — Plumber & Distributor Portal (Final Edition w/ Barcode Scanner)
+=========================================================================================
 """
 
 import os
@@ -329,14 +329,13 @@ def admin_delete_plumber():
     conn = get_db()
     pid = request.form.get("plumber_id")
     
-    # 1. Unlink redeemed codes so they aren't orphaned (they remain redeemed, but unlinked to this deleted user)
+    # Unlink redeemed codes
     db_execute(conn, "UPDATE codes SET redeemed_by_plumber_id = NULL WHERE redeemed_by_plumber_id = %s", (pid,))
     
-    # 2. Delete all related history to prevent crashes
+    # Delete history
     db_execute(conn, "DELETE FROM points_ledger WHERE plumber_id = %s", (pid,))
     db_execute(conn, "DELETE FROM redemption_requests WHERE plumber_id = %s", (pid,))
     
-    # 3. Get phone number, delete login attempts, then delete plumber
     p = db_execute(conn, "SELECT phone FROM plumbers WHERE id = %s", (pid,)).fetchone()
     if p:
         db_execute(conn, "DELETE FROM login_attempts WHERE phone = %s AND role = 'plumber'", (p['phone'],))
@@ -354,12 +353,10 @@ def admin_delete_distributor():
     conn = get_db()
     did = request.form.get("distributor_id")
     
-    # Check safety lock: Ensure distributor has no active plumbers
     count = db_execute(conn, "SELECT COUNT(*) AS c FROM plumbers WHERE distributor_id = %s", (did,)).fetchone()["c"]
     if count > 0:
         return redirect(url_for("admin_dashboard", error="Action Blocked: This distributor still has active plumbers connected to them. You must delete their plumbers first."))
         
-    # Get phone number, delete login attempts, then delete distributor
     d = db_execute(conn, "SELECT phone FROM distributors WHERE id = %s", (did,)).fetchone()
     if d:
         db_execute(conn, "DELETE FROM login_attempts WHERE phone = %s AND role = 'distributor'", (d['phone'],))
@@ -772,7 +769,6 @@ BASE_STYLE = """
 </style>
 """
 
-# Completely stealth landing page (no admin links)
 LANDING_PAGE = BASE_STYLE + """
 <div class="hero">
   <h1>Plumber Rewards Program</h1>
@@ -783,7 +779,7 @@ LANDING_PAGE = BASE_STYLE + """
     <h3>How it works</h3>
     <div class="steps">
       <div class="step"><div class="step-num">1</div>Buy products and find a scratch code inside.</div>
-      <div class="step"><div class="step-num">2</div>Enter the code in your portal to earn points.</div>
+      <div class="step"><div class="step-num">2</div>Scan the code in your portal to earn points.</div>
       <div class="step"><div class="step-num">3</div>Request a redemption and show the code to your distributor.</div>
       <div class="step"><div class="step-num">4</div>Your distributor approves it and settles your reward.</div>
     </div>
@@ -792,7 +788,7 @@ LANDING_PAGE = BASE_STYLE + """
     <div class="card">
       <div class="icon">🔧</div>
       <h3>Plumber</h3>
-      <p>Enter codes, track your points, and request redemptions.</p>
+      <p>Scan codes, track your points, and request redemptions.</p>
       <div class="card-actions">
         <a class="btn" href="/login">Log in</a>
         <a class="btn btn-outline" href="/register">Register</a>
@@ -953,6 +949,7 @@ DISTRIBUTOR_REGISTER_PAGE = BASE_STYLE + """
 </div>
 """
 
+# The Dashboard now includes the html5-qrcode scanner integration!
 DASHBOARD_PAGE = BASE_STYLE + """
 <div class="box">
   <h2>Hello, {{ plumber['name'] }}</h2>
@@ -963,12 +960,59 @@ DASHBOARD_PAGE = BASE_STYLE + """
   <div class="balance">{{ balance }}</div>
 
   <hr>
-  <h3>Enter code(s)</h3>
-  <form method="post" action="/redeem-code">
-    <textarea name="codes" rows="4" placeholder="Enter one or more codes — one per line, or separated by commas/spaces&#10;e.g.&#10;XXXX-XXXX-XXXX&#10;YYYY-YYYY-YYYY" required
+  <h3>Redeem Code</h3>
+  
+  <button type="button" id="start-scan-btn" class="btn btn-outline" style="margin-bottom: 14px; background:#fff; color:#c0392b; border:2px solid #c0392b;">📷 Scan QR / Barcode</button>
+  <div id="reader" style="width:100%; display:none; margin-bottom: 14px; border-radius: 8px; overflow: hidden; border: 1px solid #ccc;"></div>
+
+  <form method="post" action="/redeem-code" id="redeem-form">
+    <textarea id="code-input" name="codes" rows="2" placeholder="Scan a code above, or type it manually here..." required
       style="width:100%; padding:10px; margin:6px 0 14px 0; border:1px solid #ccc; border-radius:6px; font-size:15px; font-family:inherit; resize:vertical;"></textarea>
-    <button type="submit">Submit code(s)</button>
+    <button type="submit">Submit Code</button>
   </form>
+
+  <script src="https://unpkg.com/html5-qrcode"></script>
+  <script>
+    const scanBtn = document.getElementById('start-scan-btn');
+    const readerDiv = document.getElementById('reader');
+    const codeInput = document.getElementById('code-input');
+    const redeemForm = document.getElementById('redeem-form');
+    let html5QrCode;
+
+    scanBtn.addEventListener('click', () => {
+      if (readerDiv.style.display === 'none') {
+        readerDiv.style.display = 'block';
+        scanBtn.innerText = "Stop Scanning";
+        html5QrCode = new Html5Qrcode("reader");
+        
+        html5QrCode.start(
+          { facingMode: "environment" }, // Use back camera
+          { fps: 10, qrbox: { width: 250, height: 250 } },
+          (decodedText, decodedResult) => {
+            // Success! Stop camera, hide view, fill input, and auto-submit
+            html5QrCode.stop().then(() => {
+              readerDiv.style.display = 'none';
+              scanBtn.innerText = "📷 Scan QR / Barcode";
+              codeInput.value = decodedText;
+              redeemForm.submit();
+            });
+          },
+          (errorMessage) => {
+            // Parse errors are normal while camera focuses, ignore them
+          }
+        ).catch((err) => {
+          alert("Camera access denied or error starting scanner. Please ensure permissions are granted.");
+        });
+      } else {
+        if (html5QrCode) {
+          html5QrCode.stop().then(() => {
+            readerDiv.style.display = 'none';
+            scanBtn.innerText = "📷 Scan QR / Barcode";
+          });
+        }
+      }
+    });
+  </script>
 
   <hr>
   <h3>Request redemption</h3>
